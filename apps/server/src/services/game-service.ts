@@ -18,10 +18,11 @@ import {
   applySampleEffects,
   CATALOG_VERSION,
   createSpeciesState,
-  disperseSpecies,
+  disperseOverwinter,
   evaluateSample,
   evolveSeason,
   generateSiteState,
+  generateWinterClimate,
   getPhenologyWindow,
   getPlantPresentation,
   getStatus,
@@ -68,6 +69,7 @@ interface SiteStateRow {
   light_lux: number;
   wind_speed: number;
   disturbance: number;
+  winter_climate_json?: string | null;
 }
 
 interface SpeciesStateRow {
@@ -81,6 +83,7 @@ interface SpeciesStateRow {
   suitability: number;
   status: string;
   phenology_json: string;
+  capacity_multiplier?: number;
 }
 
 interface EventRow {
@@ -488,6 +491,9 @@ export class GameService {
   private regenerateEnvironments(save: SaveRecord): void {
     const current = this.getSiteStates(save.id, save.year);
     const disturbance = new Map(current.map((state) => [state.siteId, state.disturbance]));
+    const carriedWinterClimate = new Map(
+      current.map((state) => [state.siteId, state.winterClimate ?? null])
+    );
     const environmentBySite = new Map<SiteId, SiteState>();
     for (const site of SITES) {
       const state = generateSiteState(
@@ -499,6 +505,8 @@ export class GameService {
         site.id,
         disturbance.get(site.id) ?? 0.08
       );
+      // 春季重算当日环境时保留越冬气候记录；该字段只在跨年时写入
+      state.winterClimate = save.season === 'spring' ? carriedWinterClimate.get(site.id) ?? null : null;
       this.upsertSiteState(state);
       this.recordEnvironmentHistory(state, save.season, save.day);
       environmentBySite.set(site.id, state);
@@ -770,16 +778,17 @@ export class GameService {
     }
 
     const profile = definition.zones[save.current_site_id]!;
+    const seedCap = profile.carryingCapacity * (state.capacityMultiplier ?? 1) * 1.8;
     if (action === 'reduce_disturbance' || action === 'restore_wetland') {
       site.disturbance = Math.max(0, site.disturbance - (action === 'restore_wetland' ? 0.1 : 0.07));
       state.health = Math.min(100, state.health + 3);
     }
     if (action === 'protect_seed_bank') {
-      state.seedBank = Math.min(profile.carryingCapacity * 1.8, state.seedBank + profile.carryingCapacity * 0.1);
+      state.seedBank = Math.min(seedCap, state.seedBank + profile.carryingCapacity * 0.1);
     }
     if (action === 'establish_plot') {
       state.health = Math.min(100, state.health + 2);
-      state.seedBank = Math.min(profile.carryingCapacity * 1.8, state.seedBank + profile.carryingCapacity * 0.04);
+      state.seedBank = Math.min(seedCap, state.seedBank + profile.carryingCapacity * 0.04);
     }
     state.status = getStatus(state.population, profile.carryingCapacity, state.health);
     this.upsertSiteState(site);
@@ -850,15 +859,20 @@ export class GameService {
       throw new AppError('REPORT_NOT_FOUND', '年度报告尚未生成', 500);
     }
 
-    const currentSpecies = this.getSpeciesStates(save.id, save.year);
-    const currentSites = this.getSiteStates(save.id, save.year);
-    const siteMap = new Map(currentSites.map((site) => [site.siteId, site]));
-    const nextYear = save.year + 1;
-    const nextSpecies: SpeciesState[] = [];
+    const endingYear = save.year;
+    const currentSpecies = this.getSpeciesStates(save.id, endingYear);
+    const currentSites = this.getSiteStates(save.id, endingYear);
+    const winterSiteMap = new Map(currentSites.map((site) => [site.siteId, site]));
+    const nextYear = endingYear + 1;
     const nextSites: SiteState[] = [];
 
+    // 越冬极端气候由（种子、结束年份、位点）确定性派生；只写入次年春季位点，旧年冬状态不被覆盖
+    const winterClimates = new Map<SiteId, ReturnType<typeof generateWinterClimate>>();
     for (const site of SITES) {
-      const previous = siteMap.get(site.id);
+      const winterSite = winterSiteMap.get(site.id);
+      const climate = winterSite ? generateWinterClimate(save.seed, endingYear, site.id, winterSite) : null;
+      winterClimates.set(site.id, climate);
+
       const nextSite = generateSiteState(
         save.id,
         save.seed,
@@ -866,22 +880,26 @@ export class GameService {
         'spring',
         1,
         site.id,
-        Math.max(0.02, (previous?.disturbance ?? 0.08) * 0.92)
+        Math.max(0.02, (winterSite?.disturbance ?? 0.08) * 0.92)
       );
+      nextSite.winterClimate = climate;
+      // 仅插入次年记录；年份是主键的一部分，绝不触碰旧年份位点行
       this.upsertSiteState(nextSite);
       this.recordEnvironmentHistory(nextSite, 'spring', 1);
       nextSites.push(nextSite);
     }
     const nextSiteMap = new Map(nextSites.map((site) => [site.siteId, site]));
 
+    // 越冬：种群、种子库补充与承载力乘数联动结算；入参全部为旧年快照，结果属于次年
+    const overwinteredSpecies: SpeciesState[] = [];
     for (const state of currentSpecies) {
-      const site = siteMap.get(state.siteId);
+      const winterSite = winterSiteMap.get(state.siteId);
       const nextSite = nextSiteMap.get(state.siteId);
       const definition = SPECIES_BY_ID.get(state.speciesId);
-      if (!site || !nextSite || !definition) {
+      if (!winterSite || !nextSite || !definition) {
         continue;
       }
-      const overwintered = applyOverwinter(state, site);
+      const overwintered = applyOverwinter(state, winterSite, winterClimates.get(state.siteId) ?? null);
       const nextState: SpeciesState = {
         ...overwintered,
         year: nextYear,
@@ -892,10 +910,15 @@ export class GameService {
         definition.zones[state.siteId]!.carryingCapacity,
         nextState.health
       );
-      nextSpecies.push(nextState);
+      overwinteredSpecies.push(nextState);
     }
 
-    const dispersedSpecies = disperseSpecies(nextSpecies, nextSites);
+    // 越冬迁移走廊：沿低海拔/暖湿通道扩散，受极端气候和实际承载力调控
+    const { states: dispersedSpecies, migrations } = disperseOverwinter(
+      overwinteredSpecies,
+      nextSites,
+      winterClimates
+    );
     for (const state of dispersedSpecies) {
       this.upsertSpeciesState(state);
     }
@@ -908,12 +931,35 @@ export class GameService {
     save.phase = 'active';
     save.year_start_species_json = JSON.stringify(dispersedSpecies);
     save.year_start_sites_json = JSON.stringify(nextSites);
+
+    const climateEffects = [...winterClimates.entries()]
+      .filter(([, climate]) => climate)
+      .map(
+        ([siteId, climate]) =>
+          `${SITES_BY_ID.get(siteId)?.name ?? siteId}遭遇${climate!.label}（强度 ${Math.round(climate!.severity * 100)}%）`
+      );
+    const migrationEffects = migrations.map(
+      (migration) =>
+        `${SITES_BY_ID.get(migration.from)?.name ?? migration.from}→${SITES_BY_ID.get(migration.to)?.name ?? migration.to}：${
+          SPECIES_BY_ID.get(migration.speciesId)?.name ?? migration.speciesId
+        } 迁移 ${round(migration.population, 1)} 株`
+    );
+    const effects = [
+      '越冬与种子繁殖已结算',
+      '物候和分布变化进入新年度',
+      ...(climateEffects.length > 0 ? climateEffects : ['本年度未发生全域极端越冬气候']),
+      ...(migrationEffects.length > 0 ? migrationEffects.slice(0, 6) : [])
+    ];
     return {
       event: {
         type: 'BEGIN_NEXT_YEAR',
         message: `进入第 ${nextYear} 年，春季物候基线已更新`,
-        effects: ['越冬与种子繁殖已结算', '物候和分布变化进入新年度'],
-        payload: { year: nextYear }
+        effects,
+        payload: {
+          year: nextYear,
+          climates: [...winterClimates.entries()].map(([siteId, climate]) => ({ siteId, climate })),
+          migrations
+        }
       }
     };
   }
@@ -1169,7 +1215,8 @@ export class GameService {
           soilMoisture: environment.soilMoisture,
           lightLux: environment.lightLux,
           windSpeed: environment.windSpeed,
-          disturbance: environment.disturbance
+          disturbance: environment.disturbance,
+          winterClimate: environment.winterClimate ?? null
         },
         species: states
       };
@@ -1248,6 +1295,7 @@ export class GameService {
       protected: definition.protected,
       population: round(state.population, 1),
       carryingCapacity: profile.carryingCapacity,
+      capacityMultiplier: round(state.capacityMultiplier ?? 1, 2),
       health: round(state.health, 1),
       seedBank: round(state.seedBank, 1),
       suitability: round(state.suitability, 3),
@@ -1355,8 +1403,8 @@ export class GameService {
     this.store.db
       .prepare(
         `INSERT INTO site_states
-         (save_id, year, site_id, weather, temperature_c, humidity, soil_moisture, light_lux, wind_speed, disturbance)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (save_id, year, site_id, weather, temperature_c, humidity, soil_moisture, light_lux, wind_speed, disturbance, winter_climate_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(save_id, year, site_id) DO UPDATE SET
            weather = excluded.weather,
            temperature_c = excluded.temperature_c,
@@ -1364,7 +1412,8 @@ export class GameService {
            soil_moisture = excluded.soil_moisture,
            light_lux = excluded.light_lux,
            wind_speed = excluded.wind_speed,
-           disturbance = excluded.disturbance`
+           disturbance = excluded.disturbance,
+           winter_climate_json = excluded.winter_climate_json`
       )
       .run(
         state.saveId,
@@ -1376,7 +1425,8 @@ export class GameService {
         state.soilMoisture,
         state.lightLux,
         state.windSpeed,
-        state.disturbance
+        state.disturbance,
+        JSON.stringify(state.winterClimate ?? null)
       );
   }
 
@@ -1401,15 +1451,16 @@ export class GameService {
     this.store.db
       .prepare(
         `INSERT INTO species_states
-         (save_id, year, site_id, species_id, population, health, seed_bank, suitability, status, phenology_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (save_id, year, site_id, species_id, population, health, seed_bank, suitability, status, phenology_json, capacity_multiplier)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(save_id, year, site_id, species_id) DO UPDATE SET
            population = excluded.population,
            health = excluded.health,
            seed_bank = excluded.seed_bank,
            suitability = excluded.suitability,
            status = excluded.status,
-           phenology_json = excluded.phenology_json`
+           phenology_json = excluded.phenology_json,
+           capacity_multiplier = excluded.capacity_multiplier`
       )
       .run(
         state.saveId,
@@ -1421,7 +1472,8 @@ export class GameService {
         state.seedBank,
         state.suitability,
         state.status,
-        JSON.stringify(state.phenology)
+        JSON.stringify(state.phenology),
+        state.capacityMultiplier ?? 1
       );
   }
 
@@ -1486,7 +1538,8 @@ function rowToSiteState(row: SiteStateRow): SiteState {
     soilMoisture: Number(row.soil_moisture),
     lightLux: Number(row.light_lux),
     windSpeed: Number(row.wind_speed),
-    disturbance: Number(row.disturbance)
+    disturbance: Number(row.disturbance),
+    winterClimate: parseJson(row.winter_climate_json ?? 'null', null)
   };
 }
 
@@ -1504,7 +1557,8 @@ function rowToSpeciesState(row: SpeciesStateRow): SpeciesState {
     phenology: {
       ...parseJson(row.phenology_json, { bloomStartDay: 5, bloomPeakDay: 7, bloomEndDay: 9 }),
       shift: Number(parseJson<{ shift?: number }>(row.phenology_json, {}).shift ?? 0)
-    }
+    },
+    capacityMultiplier: Number(row.capacity_multiplier ?? 1)
   };
 }
 

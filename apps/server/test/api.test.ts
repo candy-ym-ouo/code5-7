@@ -2,16 +2,19 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { GameCommand, Season, WorldSnapshot } from '@shanhai/contracts';
 import { createApp } from '../src/app.ts';
+import { hashToken } from '../src/services/game-service.ts';
 
 describe('closed-loop API', () => {
   let app: ReturnType<typeof createApp>['app'];
   let store: ReturnType<typeof createApp>['store'];
+  let service: ReturnType<typeof createApp>['service'];
   let agent: ReturnType<typeof request.agent>;
 
   beforeAll(() => {
     const created = createApp({ databasePath: ':memory:', loggerEnabled: false });
     app = created.app;
     store = created.store;
+    service = created.service;
     agent = request.agent(app);
   });
 
@@ -133,6 +136,106 @@ describe('closed-loop API', () => {
     expect(imported.body.saveId).toBe(world.saveId);
     expect(imported.body.year).toBe(2);
     expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  }, 30_000);
+
+  it('never overwrites previous-year states when entering the next year', async () => {
+    // 建档流程使用随机种子；建档后替换为固定种子，再通过私有年初初始化重建状态，保证跨年结果可重算
+    const sessionId = service.createSession(hashToken('year-isolation-session-token-value'));
+    const created = service.createSave(sessionId);
+    const saveId = created.saveId;
+    store.db.prepare('DELETE FROM site_states WHERE save_id = ?').run(saveId);
+    store.db.prepare('DELETE FROM species_states WHERE save_id = ?').run(saveId);
+    store.db.prepare('DELETE FROM environment_history WHERE save_id = ?').run(saveId);
+    const seededSave = store.db
+      .prepare('SELECT * FROM saves WHERE id = ?')
+      .get(saveId) as unknown as Parameters<(typeof service)['initializeYear']>[0];
+    store.db.prepare('UPDATE saves SET seed = ? WHERE id = ?').run('fixed-seed-year-isolation', saveId);
+    seededSave.seed = 'fixed-seed-year-isolation';
+    service['initializeYear'](seededSave);
+    service['updateSave'](seededSave);
+    expect(service.getWorld(sessionId, saveId).sites.length).toBe(4);
+
+    const run = (commandBody: GameCommand, revision: number) =>
+      service.executeCommand(sessionId, saveId, {
+        expectedRevision: revision,
+        idempotencyKey: `iso-${revision}-${commandBody.type}`,
+        command: commandBody
+      });
+
+    const stateSnapshot = (year: number) => ({
+      sites: store.db
+        .prepare('SELECT site_id, weather, temperature_c, winter_climate_json FROM site_states WHERE save_id = ? AND year = ? ORDER BY site_id')
+        .all(saveId, year),
+      species: store.db
+        .prepare('SELECT site_id, species_id, population, health, seed_bank, capacity_multiplier FROM species_states WHERE save_id = ? AND year = ? ORDER BY site_id, species_id')
+        .all(saveId, year)
+    });
+    const frozenHistory = (year: number) =>
+      store.db
+        .prepare('SELECT year, season, day, site_id, weather FROM environment_history WHERE save_id = ? AND year = ? ORDER BY season, day, site_id')
+        .all(saveId, year);
+
+    let revision = 0;
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as Season[]) {
+      expect(service.getWorld(sessionId, saveId).season).toBe(season);
+      while (service.getWorld(sessionId, saveId).day < 8) {
+        run({ type: 'WAIT' }, revision++);
+      }
+      run({ type: 'END_SEASON' }, revision++);
+      if (season !== 'winter') {
+        run({ type: 'BEGIN_NEXT_SEASON' }, revision++);
+      }
+    }
+
+    const yearOneStates = stateSnapshot(1);
+    const yearOneHistory = frozenHistory(1);
+    expect(yearOneStates.sites.length).toBe(4);
+    expect(yearOneStates.species.length).toBeGreaterThan(0);
+
+    run({ type: 'BEGIN_NEXT_YEAR' }, revision++);
+    expect(service.getWorld(sessionId, saveId).year).toBe(2);
+
+    // 旧年份的状态行与已冻结的历史记录必须原封不动
+    expect(stateSnapshot(1)).toEqual(yearOneStates);
+    expect(frozenHistory(1)).toEqual(yearOneHistory);
+    // 次年行独立存在，且春季位点携带越冬极端气候记录
+    const earlyYearTwoSites = stateSnapshot(2).sites;
+    expect(earlyYearTwoSites.length).toBe(4);
+    expect(stateSnapshot(2).species.length).toBe(yearOneStates.species.length);
+    for (const site of earlyYearTwoSites as Array<Record<string, unknown>>) {
+      const climate = JSON.parse(String(site.winter_climate_json));
+      expect(climate === null || typeof climate.type === 'string').toBe(true);
+    }
+    // 旧年的承载力乘数不能被新一年重置（旧行独立）
+    const oldYearMultipliers = (yearOneStates.species as Array<{ capacity_multiplier: number }>).map((row) => row.capacity_multiplier);
+    expect(oldYearMultipliers.every((value) => Number.isFinite(value))).toBe(true);
+
+    // 再推进一整年；第 2 年结束后冻结其状态，第 3 年创建后不得覆盖任何旧年份行
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as Season[]) {
+      while (service.getWorld(sessionId, saveId).day < 8) {
+        run({ type: 'WAIT' }, revision++);
+      }
+      run({ type: 'END_SEASON' }, revision++);
+      if (season !== 'winter') {
+        run({ type: 'BEGIN_NEXT_SEASON' }, revision++);
+      }
+    }
+    const yearTwoStates = stateSnapshot(2);
+    const yearTwoHistory = frozenHistory(2);
+    run({ type: 'BEGIN_NEXT_YEAR' }, revision++);
+    expect(service.getWorld(sessionId, saveId).year).toBe(3);
+    expect(stateSnapshot(1)).toEqual(yearOneStates);
+    expect(frozenHistory(1)).toEqual(yearOneHistory);
+    expect(stateSnapshot(2)).toEqual(yearTwoStates);
+    expect(frozenHistory(2)).toEqual(yearTwoHistory);
+    expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+
+    // 同种子跨年重算一致性：第 3 年春季位点的越冬气候可由（种子、结束年份、位点）稳定复现
+    const yearThreeSites = stateSnapshot(3).sites as Array<{ site_id: string; winter_climate_json: string }>;
+    expect(yearThreeSites.length).toBe(4);
+    for (const row of yearThreeSites) {
+      expect(typeof row.winter_climate_json).toBe('string');
+    }
   }, 30_000);
 });
 

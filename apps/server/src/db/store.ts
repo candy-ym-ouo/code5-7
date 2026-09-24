@@ -16,9 +16,19 @@ export class Store {
   }
 
   private migrate(): void {
-    const columns = this.db.prepare('PRAGMA table_info(samples)').all() as unknown as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === 'slot')) {
+    const samplesColumns = this.db.prepare('PRAGMA table_info(samples)').all() as unknown as Array<{ name: string }>;
+    if (!samplesColumns.some((column) => column.name === 'slot')) {
       this.db.exec('ALTER TABLE samples ADD COLUMN slot INTEGER NOT NULL DEFAULT 1');
+    }
+
+    const speciesColumns = this.db.prepare('PRAGMA table_info(species_states)').all() as unknown as Array<{ name: string }>;
+    if (!speciesColumns.some((column) => column.name === 'capacity_multiplier')) {
+      this.db.exec('ALTER TABLE species_states ADD COLUMN capacity_multiplier REAL NOT NULL DEFAULT 1');
+    }
+
+    const siteColumns = this.db.prepare('PRAGMA table_info(site_states)').all() as unknown as Array<{ name: string }>;
+    if (!siteColumns.some((column) => column.name === 'winter_climate_json')) {
+      this.db.exec("ALTER TABLE site_states ADD COLUMN winter_climate_json TEXT NOT NULL DEFAULT 'null'");
     }
   }
 

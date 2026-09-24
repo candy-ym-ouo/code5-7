@@ -50,6 +50,14 @@ export interface SpeciesDefinition {
   sampleProtocol: SampleMethod[];
 }
 
+export type ExtremeClimateType = 'cold_wave' | 'ice_storm' | 'winter_flood' | 'warm_drought';
+
+export interface ExtremeClimateEvent {
+  type: ExtremeClimateType;
+  label: string;
+  severity: number;
+}
+
 export interface SiteState {
   saveId: string;
   year: number;
@@ -61,6 +69,8 @@ export interface SiteState {
   lightLux: number;
   windSpeed: number;
   disturbance: number;
+  /** 上一冬的极端气候事件；仅记录在次年春季的位点状态上，旧年份状态保持不变 */
+  winterClimate?: ExtremeClimateEvent | null;
 }
 
 export interface PhenologyState {
@@ -81,6 +91,8 @@ export interface SpeciesState {
   suitability: number;
   status: string;
   phenology: PhenologyState;
+  /** 当前实际承载力相对名义承载力的乘数；极端气候会压低它，随后逐季恢复 */
+  capacityMultiplier: number;
 }
 
 export interface PlantPresentation {
@@ -106,4 +118,23 @@ export interface SeasonEvolutionResult {
   state: SpeciesState;
   populationChange: number;
   healthChange: number;
+}
+
+export interface OverwinterResult {
+  state: SpeciesState;
+  climate: ExtremeClimateEvent | null;
+  recruitment: number;
+}
+
+export interface CorridorMigration {
+  speciesId: string;
+  from: SiteId;
+  to: SiteId;
+  population: number;
+  seedBank: number;
+}
+
+export interface OverwinterDispersalResult {
+  states: SpeciesState[];
+  migrations: CorridorMigration[];
 }

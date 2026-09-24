@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS site_states (
   light_lux REAL NOT NULL,
   wind_speed REAL NOT NULL,
   disturbance REAL NOT NULL,
+  winter_climate_json TEXT NOT NULL DEFAULT 'null',
   PRIMARY KEY (save_id, year, site_id)
 );
 
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS species_states (
   suitability REAL NOT NULL,
   status TEXT NOT NULL,
   phenology_json TEXT NOT NULL,
+  capacity_multiplier REAL NOT NULL DEFAULT 1,
   PRIMARY KEY (save_id, year, site_id, species_id)
 );
 

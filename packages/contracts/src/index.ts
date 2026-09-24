@@ -100,6 +100,12 @@ export interface CatalogMeta {
   species: Array<z.infer<typeof PublicSpeciesSchema>>;
 }
 
+export interface ExtremeClimateSnapshot {
+  type: 'cold_wave' | 'ice_storm' | 'winter_flood' | 'warm_drought';
+  label: string;
+  severity: number;
+}
+
 export interface SiteSnapshot {
   id: SiteId;
   name: string;
@@ -116,6 +122,7 @@ export interface SiteSnapshot {
     lightLux: number;
     windSpeed: number;
     disturbance: number;
+    winterClimate: ExtremeClimateSnapshot | null;
   };
   species: SpeciesSnapshot[];
 }
@@ -128,6 +135,7 @@ export interface SpeciesSnapshot {
   protected: boolean;
   population: number;
   carryingCapacity: number;
+  capacityMultiplier: number;
   health: number;
   seedBank: number;
   suitability: number;

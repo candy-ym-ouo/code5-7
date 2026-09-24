@@ -211,6 +211,8 @@ code { font-family: "SFMono-Regular", Consolas, monospace; }
 .weather-card dl div { padding: .6rem; border: 1px solid rgba(255, 255, 255, .1); border-radius: 3px; background: rgba(255, 255, 255, .045); }
 .weather-card dt { color: #aabbb0; font-size: .7rem; }
 .weather-card dd { margin: .15rem 0 0; font-weight: 800; }
+.weather-card .climate-badge { margin: 0 0 1.2rem; padding: .6rem .7rem; border: 1px solid rgba(233, 181, 110, .55); border-radius: 3px; background: rgba(233, 181, 110, .14); color: #f3d9ae; font-size: .78rem; line-height: 1.5; }
+.species-metrics dd small { font-weight: 400; color: #8a8270; font-size: .7rem; }
 .site-species, .species-workspace, .field-tools, .restoration-card, .end-season-bar, .review-panel, .event-rail, .document-section, .settings-card {
   margin-top: 1rem;
   border: 1px solid var(--line);

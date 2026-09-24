@@ -117,6 +117,12 @@ export function PlayPage() {
                   <div><dt>风速</dt><dd>{currentSite.environment.windSpeed.toFixed(1)} m/s</dd></div>
                   <div><dt>干扰</dt><dd>{Math.round(currentSite.environment.disturbance * 100)}%</dd></div>
                 </dl>
+                {currentSite.environment.winterClimate && (
+                  <p className="climate-badge" role="note">
+                    ⚠ 上一冬遭遇{currentSite.environment.winterClimate.label}，强度{' '}
+                    {Math.round(currentSite.environment.winterClimate.severity * 100)}%：种群、种子库与承载力受冲击
+                  </p>
+                )}
                 <button className="button button-quiet full-width" type="button" onClick={() => void run({ type: 'WAIT' })} disabled={pending}>
                   原地等待一轮
                 </button>
@@ -159,7 +165,15 @@ export function PlayPage() {
                   </div>
                   <dl className="species-metrics">
                     <div><dt>种群</dt><dd>{selectedSpecies.population.toFixed(0)}</dd></div>
-                    <div><dt>承载量</dt><dd>{selectedSpecies.carryingCapacity}</dd></div>
+                    <div>
+                      <dt>承载量</dt>
+                      <dd>
+                        {Math.round(selectedSpecies.carryingCapacity * selectedSpecies.capacityMultiplier)}
+                        {selectedSpecies.capacityMultiplier < 0.99 && (
+                          <small>（基线 {selectedSpecies.carryingCapacity}）</small>
+                        )}
+                      </dd>
+                    </div>
                     <div><dt>健康</dt><dd>{selectedSpecies.health.toFixed(0)}</dd></div>
                     <div><dt>种子库</dt><dd>{selectedSpecies.seedBank.toFixed(0)}</dd></div>
                   </dl>
