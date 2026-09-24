@@ -1,6 +1,6 @@
-import type { SpeciesDefinition, SiteDefinition } from './types.ts';
+import type { CorridorDefinition, SpeciesDefinition, SiteDefinition } from './types.ts';
 
-export const CATALOG_VERSION = '1.0.0';
+export const CATALOG_VERSION = '1.1.0';
 
 export const SITES: SiteDefinition[] = [
   {
@@ -52,6 +52,23 @@ export const SITES: SiteDefinition[] = [
     lightMultiplier: 1.05
   }
 ];
+
+/**
+ * 迁移走廊连接相邻生境。basePermeability 是无干扰、无极端天气时的
+ * 通行能力（0 完全阻断，1 完全畅通），实际通行能力还会受到源区域干扰、
+ * 走廊两端极端天气和目标生境适宜度的影响。
+ */
+export const CORRIDORS: CorridorDefinition[] = [
+  { id: 'foothill-ridge', name: '向阳坡脊线', from: 'foothill', to: 'ridge', basePermeability: 0.62 },
+  { id: 'foothill-mixed', name: '林缘过渡带', from: 'foothill', to: 'mixed_forest', basePermeability: 0.9 },
+  { id: 'foothill-stream', name: '季节性溪沟', from: 'foothill', to: 'stream_valley', basePermeability: 0.35 },
+  { id: 'mixed-stream', name: '溪畔林带', from: 'mixed_forest', to: 'stream_valley', basePermeability: 0.8 },
+  { id: 'mixed-ridge', name: '阴坡垭口', from: 'mixed_forest', to: 'ridge', basePermeability: 0.55 },
+  { id: 'stream-ridge', name: '云雾风口', from: 'stream_valley', to: 'ridge', basePermeability: 0.3 }
+];
+
+export const CORRIDOR_IDS = CORRIDORS.map((corridor) => corridor.id);
+export const CORRIDORS_BY_ID = new Map(CORRIDORS.map((corridor) => [corridor.id, corridor]));
 
 export const SPECIES: SpeciesDefinition[] = [
   {

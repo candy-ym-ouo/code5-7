@@ -14,14 +14,16 @@ import type {
 } from '@shanhai/contracts';
 import { SEASON_LABELS } from '@shanhai/contracts';
 import {
-  applyOverwinter,
+  applyOverwinterDetailed,
   applySampleEffects,
   CATALOG_VERSION,
   createSpeciesState,
-  disperseSpecies,
+  disperseSpeciesDetailed,
   evaluateSample,
   evolveSeason,
   generateSiteState,
+  generateWinterClimate,
+  getExtremeClimateLabel,
   getPhenologyWindow,
   getPlantPresentation,
   getStatus,
@@ -32,7 +34,8 @@ import {
   SITES,
   SITES_BY_ID,
   type SiteState,
-  type SpeciesState
+  type SpeciesState,
+  type WinterClimate
 } from '@shanhai/game-core';
 import type { Store } from '../db/store.ts';
 import { config } from '../config.ts';
@@ -854,6 +857,10 @@ export class GameService {
     const currentSites = this.getSiteStates(save.id, save.year);
     const siteMap = new Map(currentSites.map((site) => [site.siteId, site]));
     const nextYear = save.year + 1;
+
+    // 冬季气候只由存档种子和年份决定，重放同一年份结果必须一致
+    const winterClimate = generateWinterClimate(save.seed, save.year, currentSites);
+
     const nextSpecies: SpeciesState[] = [];
     const nextSites: SiteState[] = [];
 
@@ -874,6 +881,8 @@ export class GameService {
     }
     const nextSiteMap = new Map(nextSites.map((site) => [site.siteId, site]));
 
+    let totalMortality = 0;
+    let totalRecruitment = 0;
     for (const state of currentSpecies) {
       const site = siteMap.get(state.siteId);
       const nextSite = nextSiteMap.get(state.siteId);
@@ -881,9 +890,11 @@ export class GameService {
       if (!site || !nextSite || !definition) {
         continue;
       }
-      const overwintered = applyOverwinter(state, site);
+      const result = applyOverwinterDetailed(state, site, { winter: winterClimate });
+      totalMortality += result.mortality;
+      totalRecruitment += result.recruitment;
       const nextState: SpeciesState = {
-        ...overwintered,
+        ...result.state,
         year: nextYear,
         suitability: round(getSuitability(definition, nextSite), 3)
       };
@@ -895,8 +906,19 @@ export class GameService {
       nextSpecies.push(nextState);
     }
 
-    const dispersedSpecies = disperseSpecies(nextSpecies, nextSites);
-    for (const state of dispersedSpecies) {
+    const dispersal = disperseSpeciesDetailed(nextSpecies, nextSites, {
+      corridorAccess: winterClimate.corridorAccess
+    });
+    for (const state of dispersal.states) {
+      // 旧年份状态属于历史记录，绝不能被新一年的扩散结果覆盖
+      if (state.year !== nextYear) {
+        throw new AppError(
+          'STATE_YEAR_MISMATCH',
+          '跨年扩散结果年份异常，已中止以保护历史年度状态',
+          500,
+          { expectedYear: nextYear, actualYear: state.year }
+        );
+      }
       this.upsertSpeciesState(state);
     }
 
@@ -906,14 +928,40 @@ export class GameService {
     save.slot = 1;
     save.action_points = 30;
     save.phase = 'active';
-    save.year_start_species_json = JSON.stringify(dispersedSpecies);
+    save.year_start_species_json = JSON.stringify(dispersal.states);
     save.year_start_sites_json = JSON.stringify(nextSites);
+
+    const climateLabel = getExtremeClimateLabel(winterClimate.extreme);
+    const effects = [
+      '越冬与种子繁殖已结算',
+      '物候和分布变化进入新年度',
+      `越冬死亡 ${round(totalMortality, 1)} 株，种子补充 ${round(totalRecruitment, 1)} 株`,
+      `走廊迁移 ${round(dispersal.totalMigrants, 1)} 株，种子流定植 ${round(dispersal.totalSeedRain, 1)} 处`
+    ];
+    if (winterClimate.extreme !== 'none') {
+      effects.push(`冬季遭遇${climateLabel}（强度 ${Math.round(winterClimate.severity * 100)}%）`);
+    }
     return {
       event: {
         type: 'BEGIN_NEXT_YEAR',
-        message: `进入第 ${nextYear} 年，春季物候基线已更新`,
-        effects: ['越冬与种子繁殖已结算', '物候和分布变化进入新年度'],
-        payload: { year: nextYear }
+        message:
+          winterClimate.extreme === 'none'
+            ? `进入第 ${nextYear} 年，春季物候基线已更新`
+            : `进入第 ${nextYear} 年，${climateLabel}改变了越冬格局`,
+        effects,
+        payload: {
+          year: nextYear,
+          winter: {
+            extreme: winterClimate.extreme,
+            label: climateLabel,
+            severity: winterClimate.severity,
+            corridorAccess: winterClimate.corridorAccess
+          },
+          mortality: round(totalMortality, 2),
+          recruitment: round(totalRecruitment, 2),
+          migrants: dispersal.totalMigrants,
+          seedRain: dispersal.totalSeedRain
+        }
       }
     };
   }
@@ -991,7 +1039,8 @@ export class GameService {
       .run(randomUUID(), save.id, save.year, save.season, JSON.stringify(summary), new Date().toISOString());
 
     if (save.season === 'winter') {
-      const report = this.createAnnualReport(save, finalStates);
+      const winter = generateWinterClimate(save.seed, save.year, siteStates);
+      const report = this.createAnnualReport(save, finalStates, winter);
       const shouldUnlock =
         report.populationChangePercent < -2 ||
         report.incorrectSamples > 0 ||
@@ -1011,7 +1060,7 @@ export class GameService {
     return summary;
   }
 
-  private createAnnualReport(save: SaveRecord, finalStates: SpeciesState[]): AnnualReview {
+  private createAnnualReport(save: SaveRecord, finalStates: SpeciesState[], winter?: WinterClimate): AnnualReview {
     const initialStates = parseJson<SpeciesState[]>(save.year_start_species_json, []);
     const initialByKey = new Map(initialStates.map((state) => [stateKey(state), state]));
     const finalByKey = new Map(finalStates.map((state) => [stateKey(state), state]));
@@ -1089,6 +1138,17 @@ export class GameService {
     }
     if (distributionChanges.some((item) => item.includes('濒危'))) {
       recommendations.push('对濒危区域停止剪取，优先执行降低干扰和保留种子区。');
+    }
+    if (winter && winter.extreme !== 'none') {
+      const winterLabel = getExtremeClimateLabel(winter.extreme);
+      distributionChanges.push(`冬季出现${winterLabel}，迁移走廊通行能力下降，越冬扩散和种子定植已受到限制。`);
+      if (winter.extreme === 'cold_wave' || winter.extreme === 'snowstorm') {
+        recommendations.push(`${winterLabel}后优先巡查山脊与林缘走廊，确认冻死个体并保留地表种子区。`);
+      } else if (winter.extreme === 'winter_drought') {
+        recommendations.push('冬季干旱会削弱湿生植物种子库，开春优先恢复溪谷湿地湿度。');
+      } else if (winter.extreme === 'warm_spell') {
+        recommendations.push('暖冬会打乱休眠节律，注意春季物候提前和花期错配。');
+      }
     }
     if (recommendations.length < 2) {
       recommendations.push('保持固定样方和连续物候记录，以提高下一年度花期预报置信度。');

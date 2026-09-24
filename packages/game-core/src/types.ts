@@ -18,6 +18,40 @@ export interface ZoneProfile {
   carryingCapacity: number;
 }
 
+export type ExtremeClimateType = 'none' | 'cold_wave' | 'snowstorm' | 'warm_spell' | 'winter_drought';
+
+export interface CorridorDefinition {
+  id: string;
+  name: string;
+  from: SiteId;
+  to: SiteId;
+  basePermeability: number;
+}
+
+export interface WinterClimate {
+  year: number;
+  extreme: ExtremeClimateType;
+  /** 0-1 极端事件强度，无事件时为 0 */
+  severity: number;
+  corridorAccess: Partial<Record<string, number>>;
+}
+
+export interface OverwinterOptions {
+  winter: WinterClimate;
+}
+
+export interface OverwinterResult {
+  state: SpeciesState;
+  mortality: number;
+  recruitment: number;
+}
+
+export interface DispersalResult {
+  states: SpeciesState[];
+  totalMigrants: number;
+  totalSeedRain: number;
+}
+
 export interface SpeciesDefinition {
   id: string;
   name: string;

@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { SPECIES, SPECIES_BY_ID } from './catalog.ts';
+import { CORRIDORS, SPECIES, SPECIES_BY_ID } from './catalog.ts';
 import {
   applyOverwinter,
+  applyOverwinterDetailed,
   createSpeciesState,
   disperseSpecies,
+  disperseSpeciesDetailed,
   evaluateSample,
   evolveSeason,
   generateSiteState,
+  generateWinterClimate,
   getPhenologyWindow,
   getPlantPresentation,
   getSuitability
 } from './simulation.ts';
+import type { WinterClimate } from './types.ts';
 
 describe('deterministic world simulation', () => {
   it('generates identical environments for the same seed', () => {
@@ -41,7 +45,11 @@ describe('deterministic world simulation', () => {
         expect(getSuitability(species, site)).toBeLessThanOrEqual(1);
         state = evolveSeason(state, site, [site]).state;
       }
-      state = applyOverwinter(state, generateSiteState('save', 'seed-gamma', year, 'winter', 5, 'mixed_forest'));
+      state = applyOverwinter(
+        state,
+        generateSiteState('save', 'seed-gamma', year, 'winter', 5, 'mixed_forest'),
+        { winter: generateWinterClimate('seed-gamma', year, [generateSiteState('save', 'seed-gamma', year, 'winter', 5, 'mixed_forest')]) }
+      );
       expect(Number.isFinite(state.population)).toBe(true);
       expect(Number.isFinite(state.health)).toBe(true);
       expect(state.population).toBeGreaterThanOrEqual(0);
@@ -62,7 +70,9 @@ describe('catalog-wide stability', () => {
             const site = generateSiteState('save', `seed-${species.id}`, year, season, 5, siteId as never);
             state = evolveSeason(state, site, [site]).state;
           }
-          state = applyOverwinter(state, generateSiteState('save', `seed-${species.id}`, year, 'winter', 5, siteId as never));
+          const winterSite = generateSiteState('save', `seed-${species.id}`, year, 'winter', 5, siteId as never);
+          const winter = generateWinterClimate(`seed-${species.id}`, year, [winterSite]);
+          state = applyOverwinter(state, winterSite, { winter });
           expect(Number.isFinite(state.population)).toBe(true);
           expect(Number.isFinite(state.health)).toBe(true);
           expect(Number.isFinite(state.seedBank)).toBe(true);
@@ -112,12 +122,138 @@ describe('annual dispersal', () => {
       health: 85
     };
     const before = source.population + target.population;
+    const seedBefore = source.seedBank + target.seedBank;
     const result = disperseSpecies([source, target], [foothill, mixed]);
     const nextSource = result.find((state) => state.siteId === 'foothill')!;
     const nextTarget = result.find((state) => state.siteId === 'mixed_forest')!;
     expect(nextSource.population).toBeLessThan(source.population);
     expect(nextTarget.population).toBeGreaterThan(target.population);
-    expect(nextSource.population + nextTarget.population).toBeCloseTo(before, 1);
+    expect(nextSource.population + nextTarget.population).toBeGreaterThanOrEqual(before - 0.5);
+    expect(nextSource.population + nextTarget.population).toBeLessThanOrEqual(before + source.seedBank + 0.5);
+    // 种群增加量不超过迁出个体数与种子库可供定植量之和
+    const gained = nextTarget.population - target.population;
+    const movedOut = source.population - nextSource.population;
+    expect(gained).toBeLessThanOrEqual(movedOut + seedBefore + 0.5);
+  });
+
+  it('blocks movement along corridors closed by a snowstorm', () => {
+    const species = SPECIES_BY_ID.get('liquidambar-formosana')!;
+    const preferred = {
+      temperatureC: species.preferred.temperatureC,
+      humidity: species.preferred.humidity,
+      soilMoisture: species.preferred.soilMoisture,
+      lightLux: species.preferred.lightLux,
+      weather: 'snow' as const,
+      windSpeed: 9,
+      disturbance: 0.3
+    };
+    const ridge = { ...generateSiteState('save', 'corridor-seed', 3, 'winter', 9, 'ridge'), ...preferred };
+    const mixed = {
+      ...generateSiteState('save', 'corridor-seed', 3, 'winter', 9, 'mixed_forest'),
+      ...preferred,
+      siteId: 'mixed_forest' as const
+    };
+    const openWinter = generateWinterClimate('corridor-seed', 3, [ridge, mixed]);
+    const blockedWinter: WinterClimate = {
+      ...openWinter,
+      extreme: 'snowstorm',
+      severity: 1,
+      corridorAccess: Object.fromEntries(CORRIDORS.map((c) => [c.id, 0.02]))
+    };
+    const source = {
+      ...createSpeciesState('save', 'corridor-seed', 3, 'winter', 'ridge', species.id),
+      population: species.zones.ridge!.carryingCapacity,
+      health: 92,
+      seedBank: species.zones.ridge!.carryingCapacity
+    };
+    const target = {
+      ...createSpeciesState('save', 'corridor-seed', 3, 'winter', 'mixed_forest', species.id),
+      population: 12,
+      health: 85,
+      seedBank: 5
+    };
+    const open = disperseSpeciesDetailed([source, target], [ridge, mixed], {
+      corridorAccess: openWinter.corridorAccess
+    });
+    const blocked = disperseSpeciesDetailed([source, target], [ridge, mixed], {
+      corridorAccess: blockedWinter.corridorAccess
+    });
+    expect(open.totalMigrants).toBeGreaterThan(blocked.totalMigrants);
+    expect(blocked.totalMigrants).toBeLessThan(0.5);
+  });
+});
+
+describe('winter extreme climate', () => {
+  it('is deterministic for the same seed and year', () => {
+    const sites = (['foothill', 'mixed_forest', 'stream_valley', 'ridge'] as const).map((siteId, index) =>
+      generateSiteState('save', 'climate-seed', 4, 'winter', 6 + index, siteId)
+    );
+    const first = generateWinterClimate('climate-seed', 4, sites);
+    const second = generateWinterClimate('climate-seed', 4, sites);
+    expect(first).toEqual(second);
+    // 不同年份允许出现不同事件
+    const otherYears = new Set(
+      [1, 2, 3, 5, 6, 7, 8].map((year) => generateWinterClimate('climate-seed', year, sites).extreme)
+    );
+    expect(otherYears.size).toBeGreaterThan(1);
+  });
+
+  it('recomputing past years never depends on later-year state', () => {
+    const species = SPECIES_BY_ID.get('carex-community')!;
+    const site = generateSiteState('save', 'replay-seed', 2, 'winter', 7, 'ridge');
+    const state = createSpeciesState('save', 'replay-seed', 2, 'winter', 'ridge', species.id);
+    const winter = generateWinterClimate('replay-seed', 2, [site]);
+    const first = applyOverwinterDetailed(state, site, { winter });
+    for (let year = 3; year <= 12; year += 1) {
+      const laterSite = generateSiteState('save', 'replay-seed', year, 'winter', 7, 'ridge');
+      const laterWinter = generateWinterClimate('replay-seed', year, [laterSite]);
+      applyOverwinterDetailed(first.state, laterSite, { winter: laterWinter });
+    }
+    // 先算完后续年份再重算第 2 年，结果必须与首次完全一致
+    const replay = applyOverwinterDetailed(state, site, { winter });
+    expect(replay).toEqual(first);
+  });
+
+  it('cold waves raise mortality and droughts hit moisture-loving seed banks', () => {
+    const species = SPECIES_BY_ID.get('acorus-calamus')!;
+    const site = generateSiteState('save', 'impact-seed', 1, 'winter', 8, 'stream_valley');
+    const state = createSpeciesState('save', 'impact-seed', 1, 'winter', 'stream_valley', species.id);
+    const calm = applyOverwinterDetailed(state, site, {
+      winter: { year: 1, extreme: 'none', severity: 0, corridorAccess: {} }
+    });
+    const cold = applyOverwinterDetailed(state, { ...site, temperatureC: -4 }, {
+      winter: { year: 1, extreme: 'cold_wave', severity: 1, corridorAccess: {} }
+    });
+    const drought = applyOverwinterDetailed(state, { ...site, soilMoisture: 24 }, {
+      winter: { year: 1, extreme: 'winter_drought', severity: 1, corridorAccess: {} }
+    });
+    expect(cold.mortality).toBeGreaterThan(calm.mortality);
+    expect(cold.state.health).toBeLessThan(calm.state.health);
+    expect(drought.state.seedBank).toBeLessThanOrEqual(calm.state.seedBank);
+  });
+
+  it('links recruitment to remaining carrying capacity and keeps everything bounded', () => {
+    const species = SPECIES_BY_ID.get('carex-community')!;
+    const site = generateSiteState('save', 'capacity-seed', 1, 'winter', 6, 'foothill');
+    const state = {
+      ...createSpeciesState('save', 'capacity-seed', 1, 'winter', 'foothill', species.id),
+      population: species.zones.foothill!.carryingCapacity * 0.98,
+      health: 90,
+      seedBank: species.zones.foothill!.carryingCapacity
+    };
+    const sparse: typeof state = { ...state, population: 20, seedBank: species.zones.foothill!.carryingCapacity };
+    const crowdedResult = applyOverwinterDetailed(state, site, {
+      winter: { year: 1, extreme: 'none', severity: 0, corridorAccess: {} }
+    });
+    const sparseResult = applyOverwinterDetailed(sparse, site, {
+      winter: { year: 1, extreme: 'none', severity: 0, corridorAccess: {} }
+    });
+    expect(sparseResult.recruitment).toBeGreaterThan(crowdedResult.recruitment);
+    for (const result of [crowdedResult, sparseResult]) {
+      expect(result.state.population).toBeLessThanOrEqual(species.zones.foothill!.carryingCapacity * 1.2 + 0.01);
+      expect(result.state.seedBank).toBeGreaterThanOrEqual(0);
+      expect(result.state.health).toBeGreaterThanOrEqual(0);
+    }
   });
 });
 

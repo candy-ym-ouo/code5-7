@@ -1,13 +1,19 @@
 import type { SampleMethod, Season, SiteId } from '@shanhai/contracts';
-import { SPECIES_BY_ID, SITES_BY_ID } from './catalog.ts';
+import { CORRIDORS, SPECIES_BY_ID, SITES_BY_ID } from './catalog.ts';
 import { createRng } from './rng.ts';
 import type {
+  CorridorDefinition,
+  DispersalResult,
+  ExtremeClimateType,
+  OverwinterOptions,
+  OverwinterResult,
   PlantPresentation,
   SampleDecision,
   SeasonEvolutionResult,
   SiteState,
   SpeciesDefinition,
-  SpeciesState
+  SpeciesState,
+  WinterClimate
 } from './types.ts';
 
 const SEASON_INDEX: Record<Season, number> = {
@@ -214,6 +220,74 @@ function pickWeather(
     ]
   };
   return pickWeighted(weights[season]);
+}
+
+const EXTREME_CLIMATE_LABELS: Record<ExtremeClimateType, string> = {
+  none: '无极端天气',
+  cold_wave: '强寒潮',
+  snowstorm: '持续暴雪',
+  warm_spell: '异常暖冬',
+  winter_drought: '冬季干旱'
+};
+
+/**
+ * 冬季极端气候完全由存档种子和年份决定，同种子重算任意年份结果一致。
+ */
+export function generateWinterClimate(
+  seed: string,
+  year: number,
+  winterSites: SiteState[]
+): WinterClimate {
+  const rng = createRng(`${seed}:winter-climate:${year}`);
+  const warming = (year - 1) * 0.018;
+  const weights: Array<{ value: ExtremeClimateType; weight: number }> = [
+    { value: 'none', weight: 6.4 - warming },
+    { value: 'cold_wave', weight: 1.25 - warming * 0.5 },
+    { value: 'snowstorm', weight: 0.9 },
+    { value: 'warm_spell', weight: 0.6 + warming },
+    { value: 'winter_drought', weight: 0.55 + warming * 0.5 }
+  ];
+  const extreme = rng.pickWeighted(weights);
+  const severity =
+    extreme === 'none'
+      ? 0
+      : round(0.45 + rng.between(0, 0.55), 3);
+
+  const corridorAccess: WinterClimate['corridorAccess'] = {};
+  const bySite = new Map(winterSites.map((site) => [site.siteId, site]));
+  for (const corridor of CORRIDORS) {
+    corridorAccess[corridor.id] = corridorAccessFactor(corridor, extreme, severity, bySite);
+  }
+  return { year, extreme, severity, corridorAccess };
+}
+
+function corridorAccessFactor(
+  corridor: CorridorDefinition,
+  extreme: ExtremeClimateType,
+  severity: number,
+  winterSites: Map<SiteId, SiteState>
+): number {
+  let factor = corridor.basePermeability;
+  for (const endpoint of [corridor.from, corridor.to]) {
+    const site = winterSites.get(endpoint);
+    if (site) {
+      factor *= 1 - clamp(site.disturbance, 0, 0.42) * 0.55;
+    }
+  }
+  if (extreme === 'snowstorm') {
+    factor *= 1 - 0.55 * severity;
+  } else if (extreme === 'cold_wave') {
+    factor *= 1 - 0.25 * severity;
+  } else if (extreme === 'warm_spell') {
+    factor *= 1 + 0.12 * severity;
+  } else if (extreme === 'winter_drought') {
+    factor *= 1 - 0.18 * severity;
+  }
+  return round(clamp(factor, 0.02, 1), 3);
+}
+
+export function getExtremeClimateLabel(extreme: ExtremeClimateType): string {
+  return EXTREME_CLIMATE_LABELS[extreme];
 }
 
 export function createSpeciesState(
@@ -590,23 +664,75 @@ export function evolveSeason(
   };
 }
 
-export function applyOverwinter(state: SpeciesState, site: SiteState): SpeciesState {
+const NEUTRAL_WINTER: WinterClimate = { year: 0, extreme: 'none', severity: 0, corridorAccess: {} };
+
+/**
+ * 越冬结算把种群、种子库和承载力联动：
+ * - 极端气候按物种耐寒/耐旱特性造成死亡率，健康与区域干扰会调节死亡幅度
+ * - 种子库经历自然损耗，存活部分按健康度与剩余承载力补充新生种群
+ * - 目标区域承载力越空缺、健康越好，种子补充越充分（密度依赖）
+ */
+export function applyOverwinter(
+  state: SpeciesState,
+  site: SiteState,
+  options?: OverwinterOptions
+): SpeciesState {
+  return applyOverwinterDetailed(state, site, options).state;
+}
+
+export function applyOverwinterDetailed(
+  state: SpeciesState,
+  site: SiteState,
+  options?: OverwinterOptions
+): OverwinterResult {
   const definition = SPECIES_BY_ID.get(state.speciesId);
   const profile = definition?.zones[state.siteId];
   if (!definition || !profile) {
-    return state;
+    return { state, mortality: 0, recruitment: 0 };
   }
 
-  const recruitmentPotential = state.seedBank * 0.16 * clamp(state.health / 100, 0.1, 1);
-  const recruitment = clamp(recruitmentPotential, 0, Math.max(0, profile.carryingCapacity - state.population));
-  const coldStress = site.temperatureC < definition.preferred.temperatureC - definition.tolerance.temperatureC ? 4 : 0;
-  const health = clamp(state.health + 3.5 - coldStress, 0, 100);
-  const seedBank = Math.max(0, state.seedBank - recruitment);
-  const population = clamp(state.population + recruitment, 0, profile.carryingCapacity * 1.2);
-  const seasonalShift = site.temperatureC > 5 ? -1 : site.temperatureC < 2 ? 1 : 0;
+  const winter = options?.winter ?? NEUTRAL_WINTER;
+  const healthFactor = clamp(state.health / 100, 0.25, 1);
+  const disturbanceFactor = 1 - clamp(site.disturbance, 0, 0.42) * 0.3;
+
+  let survivalRate =
+    1 -
+    (coldStressRate(site, definition) +
+      (winter.severity * extremeMortalityRate(winter.extreme, definition, site)) / 2);
+  survivalRate *= 0.92 + 0.08 * healthFactor;
+  survivalRate *= disturbanceFactor;
+  survivalRate = clamp(survivalRate, 0.55, 0.995);
+
+  const survivors = state.population * survivalRate;
+  const mortality = state.population - survivors;
+
+  const seedRetention = seedRetentionRate(winter.extreme, winter.severity, definition, site);
+  const retainedSeeds = state.seedBank * seedRetention;
+
+  const vacancy = clamp(
+    (profile.carryingCapacity - survivors) / Math.max(1, profile.carryingCapacity),
+    0,
+    1
+  );
+  const recruitmentPotential = retainedSeeds * 0.2 * healthFactor * (0.45 + 0.55 * vacancy);
+  const recruitment = clamp(
+    recruitmentPotential,
+    0,
+    Math.max(0, profile.carryingCapacity * 1.05 - survivors)
+  );
+
+  const population = clamp(survivors + recruitment, 0, profile.carryingCapacity * 1.2);
+  const seedBank = Math.max(0, retainedSeeds - recruitment);
+
+  const healthRecovery = 3.5 + vacancy * 1.2;
+  const healthDamage = winter.severity * extremeHealthDamage(winter.extreme, definition);
+  const health = clamp(state.health + healthRecovery - healthDamage - mortality / Math.max(1, state.population) * 3, 0, 100);
+
+  const seasonalShift =
+    winter.extreme === 'warm_spell' ? -Math.round(winter.severity) : site.temperatureC < 2 ? 1 : site.temperatureC > 5 ? -1 : 0;
   const nextShift = clamp((state.phenology.shift ?? 0) + seasonalShift, -2, 2);
 
-  return {
+  const nextState: SpeciesState = {
     ...state,
     population: round(population, 2),
     health: round(health, 1),
@@ -619,6 +745,85 @@ export function applyOverwinter(state: SpeciesState, site: SiteState): SpeciesSt
       shift: nextShift
     }
   };
+
+  return {
+    state: nextState,
+    mortality: round(mortality, 2),
+    recruitment: round(recruitment, 2)
+  };
+}
+
+function coldStressRate(site: SiteState, definition: SpeciesDefinition): number {
+  const threshold = definition.preferred.temperatureC - definition.tolerance.temperatureC;
+  if (site.temperatureC >= threshold) {
+    return 0;
+  }
+  return clamp((threshold - site.temperatureC) / 60, 0, 0.05);
+}
+
+function extremeMortalityRate(
+  extreme: ExtremeClimateType,
+  definition: SpeciesDefinition,
+  site: SiteState
+): number {
+  const coldSensitive = clamp((definition.preferred.temperatureC - 10) / 14, 0, 1);
+  switch (extreme) {
+    case 'cold_wave':
+      return 0.08 + 0.1 * coldSensitive;
+    case 'snowstorm':
+      return 0.05 + 0.07 * coldSensitive + (site.windSpeed > 8 ? 0.03 : 0);
+    case 'winter_drought': {
+      const moistureNeed = clamp((definition.preferred.soilMoisture - 55) / 35, 0, 1);
+      return 0.05 + 0.09 * moistureNeed;
+    }
+    case 'warm_spell':
+      // 暖冬直接死亡率低，但会扰乱休眠并消耗种子库
+      return 0.01 + 0.015 * coldSensitive;
+    default:
+      return 0;
+  }
+}
+
+function extremeHealthDamage(extreme: ExtremeClimateType, definition: SpeciesDefinition): number {
+  const coldSensitive = clamp((definition.preferred.temperatureC - 10) / 14, 0, 1);
+  switch (extreme) {
+    case 'cold_wave':
+      return 7 + 6 * coldSensitive;
+    case 'snowstorm':
+      return 5 + 4 * coldSensitive;
+    case 'winter_drought':
+      return 6 + 4 * clamp((definition.preferred.soilMoisture - 55) / 35, 0, 1);
+    case 'warm_spell':
+      return 2.5;
+    default:
+      return 0;
+  }
+}
+
+function seedRetentionRate(
+  extreme: ExtremeClimateType,
+  severity: number,
+  definition: SpeciesDefinition,
+  site: SiteState
+): number {
+  let rate = 0.7;
+  if (extreme === 'cold_wave') {
+    rate -= 0.16 * severity;
+  } else if (extreme === 'snowstorm') {
+    // 积雪反而为地表种子提供隔温层
+    rate += 0.05 * severity;
+  } else if (extreme === 'warm_spell') {
+    rate -= 0.22 * severity;
+  } else if (extreme === 'winter_drought') {
+    rate -= 0.14 * severity;
+  }
+  if (site.soilMoisture < 28) {
+    rate -= 0.06;
+  }
+  if (definition.lifeForm.includes('乔木')) {
+    rate += 0.03;
+  }
+  return clamp(rate, 0.3, 0.92);
 }
 
 export function round(value: number, digits = 0): number {
@@ -626,14 +831,30 @@ export function round(value: number, digits = 0): number {
   return Math.round(value * factorValue) / factorValue;
 }
 
-const SITE_NEIGHBORS: Record<SiteId, SiteId[]> = {
-  foothill: ['mixed_forest', 'ridge'],
-  mixed_forest: ['foothill', 'stream_valley', 'ridge'],
-  stream_valley: ['mixed_forest', 'ridge'],
-  ridge: ['foothill', 'mixed_forest', 'stream_valley']
-};
+export interface DispersalOptions {
+  corridorAccess?: Partial<Record<string, number>>;
+}
 
-export function disperseSpecies(states: SpeciesState[], sites: SiteState[]): SpeciesState[] {
+/**
+ * 越冬扩散沿迁移走廊发生：
+ * - 走廊基础通行能力受两端区域干扰和当年冬季极端气候调节
+ * - 只有高于拥挤阈值的源种群输出个体，迁入受目标承载力空缺约束
+ * - 同步发生种子流：源种群越繁盛、种子库越充实，越能在适宜但空缺的
+ *   目标生境定植，实现种群、种子库与承载力的联动
+ */
+export function disperseSpecies(
+  states: SpeciesState[],
+  sites: SiteState[],
+  options: DispersalOptions = {}
+): SpeciesState[] {
+  return disperseSpeciesDetailed(states, sites, options).states;
+}
+
+export function disperseSpeciesDetailed(
+  states: SpeciesState[],
+  sites: SiteState[],
+  options: DispersalOptions = {}
+): DispersalResult {
   const siteMap = new Map(sites.map((site) => [site.siteId, site]));
   const bySpecies = new Map<string, Map<SiteId, SpeciesState>>();
 
@@ -650,6 +871,9 @@ export function disperseSpecies(states: SpeciesState[], sites: SiteState[]): Spe
     }
   }
 
+  let totalMigrants = 0;
+  let totalSeedRain = 0;
+
   for (const [speciesId, group] of bySpecies) {
     const definition = SPECIES_BY_ID.get(speciesId);
     if (!definition) continue;
@@ -661,28 +885,68 @@ export function disperseSpecies(states: SpeciesState[], sites: SiteState[]): Spe
       if (sourceState.population < sourceProfile.carryingCapacity * 0.82) continue;
       const source = dispersed.get(`${sourceSiteId}:${speciesId}`)!;
 
-      for (const neighborId of SITE_NEIGHBORS[sourceSiteId]) {
+      for (const corridor of corridorsFrom(sourceSiteId)) {
+        const neighborId = corridor.from === sourceSiteId ? corridor.to : corridor.from;
         const neighborProfile = definition.zones[neighborId];
         const neighborSite = siteMap.get(neighborId);
         const targetState = dispersed.get(`${neighborId}:${speciesId}`);
         if (!neighborProfile || !neighborSite || !targetState) continue;
         const suitability = getSuitability(definition, neighborSite);
-        if (suitability < 0.65 || targetState.population >= neighborProfile.carryingCapacity * 0.9) continue;
+        if (suitability < 0.55 || targetState.population >= neighborProfile.carryingCapacity * 0.95) continue;
+
+        const access = options.corridorAccess?.[corridor.id] ?? corridor.basePermeability;
+        const vacancy = clamp(
+          (neighborProfile.carryingCapacity * 0.95 - targetState.population) /
+            Math.max(1, neighborProfile.carryingCapacity),
+          0,
+          1
+        );
 
         const surplus = Math.max(0, source.population - sourceProfile.carryingCapacity * 0.8);
+        const corridorCapacity = sourceProfile.carryingCapacity * 0.12 * access;
         const migrants = Math.min(
           surplus,
-          source.population * 0.04 * definition.ecology.dispersalRate,
-          neighborProfile.carryingCapacity * 0.1,
-          Math.max(0, neighborProfile.carryingCapacity * 0.9 - targetState.population)
+          source.population * 0.05 * definition.ecology.dispersalRate * access,
+          corridorCapacity,
+          Math.max(0, neighborProfile.carryingCapacity * 0.95 - targetState.population)
         );
-        if (migrants < 0.1) continue;
+        if (migrants >= 0.1) {
+          source.population = round(Math.max(0, source.population - migrants), 2);
+          source.status = getStatus(source.population, sourceProfile.carryingCapacity, source.health);
+          targetState.population = round(targetState.population + migrants, 2);
+          targetState.status = getStatus(
+            targetState.population,
+            neighborProfile.carryingCapacity,
+            targetState.health
+          );
+          targetState.suitability = round(suitability, 3);
+          totalMigrants += migrants;
+        }
 
-        source.population = round(Math.max(0, source.population - migrants), 2);
-        source.status = getStatus(source.population, sourceProfile.carryingCapacity, source.health);
-        targetState.population = round(targetState.population + migrants, 2);
-        targetState.status = getStatus(targetState.population, neighborProfile.carryingCapacity, targetState.health);
-        targetState.suitability = round(suitability, 3);
+        // 种子流：只有目标生境足够适宜且仍有空缺时才会定植
+        if (vacancy > 0.05 && suitability >= 0.6) {
+          const seedExport =
+            source.seedBank *
+            0.04 *
+            definition.ecology.dispersalRate *
+            access *
+            clamp(source.health / 100, 0.2, 1);
+          const germinated = seedExport * suitability * vacancy * 0.5;
+          const room = Math.max(0, neighborProfile.carryingCapacity - targetState.population);
+          const settled = Math.min(germinated, room);
+          if (settled >= 0.05) {
+            source.seedBank = round(Math.max(0, source.seedBank - seedExport), 2);
+            targetState.population = round(targetState.population + settled, 2);
+            targetState.seedBank = round(targetState.seedBank + (seedExport - settled), 2);
+            targetState.status = getStatus(
+              targetState.population,
+              neighborProfile.carryingCapacity,
+              targetState.health
+            );
+            targetState.suitability = round(suitability, 3);
+            totalSeedRain += settled;
+          }
+        }
       }
     }
   }
@@ -691,5 +955,13 @@ export function disperseSpecies(states: SpeciesState[], sites: SiteState[]): Spe
   for (const state of dispersed.values()) {
     (grouped[state.siteId] ??= []).push(state);
   }
-  return states.map((original) => grouped[original.siteId]?.find((state) => state.speciesId === original.speciesId) ?? original);
+  const resultStates = states.map(
+    (original) =>
+      grouped[original.siteId]?.find((state) => state.speciesId === original.speciesId) ?? original
+  );
+  return { states: resultStates, totalMigrants: round(totalMigrants, 2), totalSeedRain: round(totalSeedRain, 2) };
+}
+
+function corridorsFrom(siteId: SiteId): CorridorDefinition[] {
+  return CORRIDORS.filter((corridor) => corridor.from === siteId || corridor.to === siteId);
 }
